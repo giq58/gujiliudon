@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: guji
+  IMAGE_NAME: siliconflow-key-scanner
 
 jobs:
   build-and-push:
