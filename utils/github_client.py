@@ -10,6 +10,10 @@ from common.config import Config
 
 
 class GitHubClient:
+    """
+    GitHub API 客户端
+    用于搜索 SiliconFlow API 密钥和获取文件内容
+    """
     GITHUB_API_URL = "https://api.github.com/search/code"
 
     def __init__(self, tokens: List[str]):
@@ -26,6 +30,16 @@ class GitHubClient:
         return token.strip() if isinstance(token, str) else token
 
     def search_for_keys(self, query: str, max_retries: int = 5) -> Dict[str, Any]:
+        """
+        在GitHub上搜索SiliconFlow API密钥
+        
+        Args:
+            query: 搜索查询字符串
+            max_retries: 最大重试次数
+            
+        Returns:
+            Dict: 包含搜索结果的字典
+        """
         all_items = []
         total_count = 0
         expected_total = None
@@ -45,7 +59,7 @@ class GitHubClient:
 
                 headers = {
                     "Accept": "application/vnd.github.v3+json",
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+                    "User-Agent": "SiliconFlow-Key-Scanner/1.0 (GitHub API Client)"
                 }
 
                 if current_token:
@@ -107,7 +121,7 @@ class GitHubClient:
             if not page_success or not page_result:
                 if page == 1:
                     # 第一页失败是严重问题
-                    logger.error(f"❌ First page failed for query: {query[:50]}...")
+                    logger.error(f"❌ First page failed for SiliconFlow key search query: {query[:50]}...")
                     break
                 # 后续页面失败不记录，统计信息会体现
                 continue
@@ -134,7 +148,7 @@ class GitHubClient:
 
             if page < 10:
                 sleep_time = random.uniform(0.5, 1.5)
-                logger.info(f"⏳ Processing query: 【{query}】,page {page},item count: {current_page_count},expected total: {expected_total},total count: {total_count},random sleep: {sleep_time:.1f}s")
+                logger.info(f"⏳ Processing SiliconFlow search query: 【{query}】,page {page},item count: {current_page_count},expected total: {expected_total},total count: {total_count},random sleep: {sleep_time:.1f}s")
                 time.sleep(sleep_time)
 
         final_count = len(all_items)
@@ -157,12 +171,22 @@ class GitHubClient:
         return result
 
     def get_file_content(self, item: Dict[str, Any]) -> Optional[str]:
+        """
+        获取GitHub文件内容，用于SiliconFlow密钥扫描
+        
+        Args:
+            item: GitHub搜索结果项
+            
+        Returns:
+            Optional[str]: 文件内容或None
+        """
         repo_full_name = item["repository"]["full_name"]
         file_path = item["path"]
 
         metadata_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path}"
         headers = {
             "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "SiliconFlow-Key-Scanner/1.0 (File Content Fetcher)"
         }
 
         token = self._next_token()
@@ -173,7 +197,7 @@ class GitHubClient:
             # 获取proxy配置
             proxies = Config.get_random_proxy()
 
-            logger.info(f"🔍 Processing file: {metadata_url}")
+            logger.info(f"🔍 Processing file for SiliconFlow keys: {metadata_url}")
             if proxies:
                 metadata_response = requests.get(metadata_url, headers=headers, proxies=proxies)
             else:
@@ -204,7 +228,7 @@ class GitHubClient:
                 content_response = requests.get(download_url, headers=headers, proxies=proxies)
             else:
                 content_response = requests.get(download_url, headers=headers)
-            logger.info(f"⏳ checking for keys from:  {download_url},status: {content_response.status_code}")
+            logger.info(f"⏳ Scanning for SiliconFlow keys from: {download_url}, status: {content_response.status_code}")
             content_response.raise_for_status()
             return content_response.text
 
@@ -214,4 +238,13 @@ class GitHubClient:
 
     @staticmethod
     def create_instance(tokens: List[str]) -> 'GitHubClient':
+        """
+        创建GitHubClient实例
+        
+        Args:
+            tokens: GitHub API token列表
+            
+        Returns:
+            GitHubClient: 客户端实例
+        """
         return GitHubClient(tokens)
