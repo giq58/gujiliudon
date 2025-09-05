@@ -57,7 +57,7 @@ class Config:
 
     # SiliconFlow API 配置
     SILICONFLOW_API_BASE = os.getenv("SILICONFLOW_API_BASE", "https://api.siliconflow.cn/v1")
-    SILICONFLOW_CHECK_MODEL = os.getenv("SILICONFLOW_CHECK_MODEL", "gpt-3.5-turbo")
+    SILICONFLOW_CHECK_MODEL = os.getenv("SILICONFLOW_CHECK_MODEL", "THUDM/glm-4-9b-chat")
     
     # API请求配置
     API_TIMEOUT = int(os.getenv("API_TIMEOUT", "10"))  # API请求超时时间（秒）
