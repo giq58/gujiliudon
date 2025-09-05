@@ -1,649 +1,432 @@
- import quote, urlencode
-import sqlite3
-from pathlib import Path
+import os
+import random
+import re
+import sys
+import time
+import traceback
+from datetime import datetime, timedelta
+from typing import Dict, List, Union, Any
 import requests
-from dataclasses import dataclass
+import json
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('scanner.log')
-    ]
-)
-logger = logging.getLogger(__name__)
+from common.Logger import logger
 
-@dataclass
-class ScanResult:
-    """扫描结果数据类"""
-    repo_full_name: str
-    file_path: str
-    file_sha: str
-    api_key: str
-    raw_url: str
-    commit_sha: str
-    last_modified: str
-    is_valid: Optional[bool] = None
-    error_message: Optional[str] = None
-    quota_info: Optional[Dict] = None
+sys.path.append('../')
+from common.config import Config
+from utils.github_client import GitHubClient
+from utils.file_manager import file_manager, Checkpoint, checkpoint
+from utils.sync_utils import sync_utils
 
-class SiliconFlowValidator:
-    """SiliconFlow API密钥验证器"""
+# 创建GitHub工具实例和文件管理器
+github_utils = GitHubClient.create_instance(Config.GITHUB_TOKENS)
+
+# 统计信息
+skip_stats = {
+    "time_filter": 0,
+    "sha_duplicate": 0,
+    "age_filter": 0,
+    "doc_filter": 0
+}
+
+
+def normalize_query(query: str) -> str:
+    query = " ".join(query.split())
+
+    parts = []
+    i = 0
+    while i < len(query):
+        if query[i] == '"':
+            end_quote = query.find('"', i + 1)
+            if end_quote != -1:
+                parts.append(query[i:end_quote + 1])
+                i = end_quote + 1
+            else:
+                parts.append(query[i])
+                i += 1
+        elif query[i] == ' ':
+            i += 1
+        else:
+            start = i
+            while i < len(query) and query[i] != ' ':
+                i += 1
+            parts.append(query[start:i])
+
+    quoted_strings = []
+    language_parts = []
+    filename_parts = []
+    path_parts = []
+    other_parts = []
+
+    for part in parts:
+        if part.startswith('"') and part.endswith('"'):
+            quoted_strings.append(part)
+        elif part.startswith('language:'):
+            language_parts.append(part)
+        elif part.startswith('filename:'):
+            filename_parts.append(part)
+        elif part.startswith('path:'):
+            path_parts.append(part)
+        elif part.strip():
+            other_parts.append(part)
+
+    normalized_parts = []
+    normalized_parts.extend(sorted(quoted_strings))
+    normalized_parts.extend(sorted(other_parts))
+    normalized_parts.extend(sorted(language_parts))
+    normalized_parts.extend(sorted(filename_parts))
+    normalized_parts.extend(sorted(path_parts))
+
+    return " ".join(normalized_parts)
+
+
+def extract_keys_from_content(content: str) -> List[str]:
+    # 修改正则表达式以匹配 SiliconFlow 密钥格式 (sk-开头)
+    pattern = r'(sk-[A-Za-z0-9\-_]{32,})'
+    return re.findall(pattern, content)
+
+
+def should_skip_item(item: Dict[str, Any], checkpoint: Checkpoint) -> tuple[bool, str]:
+    """
+    检查是否应该跳过处理此item
     
-    def __init__(self, model: str = "Qwen/Qwen2.5-7B-Instruct", proxy: Optional[str] = None):
-        self.base_url = "https://api.siliconflow.cn/v1"
-        self.model = model
-        self.proxies = {"http": proxy, "https": proxy} if proxy else None
-        self.session = requests.Session()
-        if proxy:
-            self.session.proxies.update(self.proxies)
+    Returns:
+        tuple: (should_skip, reason)
+    """
+    # 检查增量扫描时间
+    if checkpoint.last_scan_time:
+        try:
+            last_scan_dt = datetime.fromisoformat(checkpoint.last_scan_time)
+            repo_pushed_at = item["repository"].get("pushed_at")
+            if repo_pushed_at:
+                repo_pushed_dt = datetime.strptime(repo_pushed_at, "%Y-%m-%dT%H:%M:%SZ")
+                if repo_pushed_dt <= last_scan_dt:
+                    skip_stats["time_filter"] += 1
+                    return True, "time_filter"
+        except Exception as e:
+            pass
+
+    # 检查SHA是否已扫描
+    if item.get("sha") in checkpoint.scanned_shas:
+        skip_stats["sha_duplicate"] += 1
+        return True, "sha_duplicate"
+
+    # 检查仓库年龄
+    repo_pushed_at = item["repository"].get("pushed_at")
+    if repo_pushed_at:
+        repo_pushed_dt = datetime.strptime(repo_pushed_at, "%Y-%m-%dT%H:%M:%SZ")
+        if repo_pushed_dt < datetime.utcnow() - timedelta(days=Config.DATE_RANGE_DAYS):
+            skip_stats["age_filter"] += 1
+            return True, "age_filter"
+
+    # 检查文档和示例文件
+    lowercase_path = item["path"].lower()
+    if any(token in lowercase_path for token in Config.FILE_PATH_BLACKLIST):
+        skip_stats["doc_filter"] += 1
+        return True, "doc_filter"
+
+    return False, ""
+
+
+def process_item(item: Dict[str, Any]) -> tuple:
+    """
+    处理单个GitHub搜索结果item
     
-    def validate_key(self, api_key: str) -> Dict[str, Any]:
-        """验证SiliconFlow API密钥"""
-        if not api_key.startswith("sk-"):
-            return {
-                "is_valid": False,
-                "error_message": "Invalid key format: must start with 'sk-'",
-                "response_data": None,
-                "rate_limited": False
-            }
+    Returns:
+        tuple: (valid_keys_count, rate_limited_keys_count)
+    """
+    delay = random.uniform(1, 4)
+    file_url = item["html_url"]
+
+    # 简化日志输出，只显示关键信息
+    repo_name = item["repository"]["full_name"]
+    file_path = item["path"]
+    time.sleep(delay)
+
+    content = github_utils.get_file_content(item)
+    if not content:
+        logger.warning(f"⚠️ Failed to fetch content for file: {file_url}")
+        return 0, 0
+
+    keys = extract_keys_from_content(content)
+
+    # 过滤占位符密钥
+    filtered_keys = []
+    for key in keys:
+        context_index = content.find(key)
+        if context_index != -1:
+            snippet = content[context_index:context_index + 45]
+            if "..." in snippet or "YOUR_" in snippet.upper() or "REPLACE" in snippet.upper():
+                continue
+        filtered_keys.append(key)
+    
+    # 去重处理
+    keys = list(set(filtered_keys))
+
+    if not keys:
+        return 0, 0
+
+    logger.info(f"�� Found {len(keys)} suspected SiliconFlow key(s), validating...")
+
+    valid_keys = []
+    rate_limited_keys = []
+
+    # 验证每个密钥
+    for key in keys:
+        validation_result = validate_siliconflow_key(key)
+        if validation_result and "ok" in validation_result:
+            valid_keys.append(key)
+            logger.info(f"✅ VALID: {key}")
+        elif validation_result == "rate_limited":
+            rate_limited_keys.append(key)
+            logger.warning(f"⚠️ RATE LIMITED: {key}, check result: {validation_result}")
+        else:
+            logger.info(f"❌ INVALID: {key}, check result: {validation_result}")
+
+    # 保存结果
+    if valid_keys:
+        file_manager.save_valid_keys(repo_name, file_path, file_url, valid_keys)
+        logger.info(f"�� Saved {len(valid_keys)} valid key(s)")
+        # 添加到同步队列（不阻塞主流程）
+        try:
+            # 添加到两个队列
+            sync_utils.add_keys_to_queue(valid_keys)
+            logger.info(f"�� Added {len(valid_keys)} key(s) to sync queues")
+        except Exception as e:
+            logger.error(f"�� Error adding keys to sync queues: {e}")
+
+    if rate_limited_keys:
+        file_manager.save_rate_limited_keys(repo_name, file_path, file_url, rate_limited_keys)
+        logger.info(f"�� Saved {len(rate_limited_keys)} rate limited key(s)")
+
+    return len(valid_keys), len(rate_limited_keys)
+
+
+def validate_siliconflow_key(api_key: str) -> Union[bool, str]:
+    """
+    验证 SiliconFlow API 密钥
+    """
+    try:
+        time.sleep(random.uniform(0.5, 1.5))
+
+        # 获取随机代理配置
+        proxy_config = Config.get_random_proxy()
         
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "SiliconFlow-Key-Scanner/1.0"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         
-        test_data = {
-            "model": self.model,
-            "messages": [
-                {"role": "user", "content": "Hello, test message for key validation."}
-            ],
-            "max_tokens": 10,
-            "temperature": 0.1
+        # 构建请求数据 - 使用简单的聊天完成请求来测试密钥
+        data = {
+            "model": "gpt-3.5-turbo",  # 使用常见的模型名
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
         }
         
-        try:
-            response = self.session.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=test_data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                return {
-                    "is_valid": True,
-                    "error_message": None,
-                    "response_data": response.json(),
-                    "rate_limited": False
-                }
-            elif response.status_code == 401:
-                return {
-                    "is_valid": False,
-                    "error_message": "Unauthorized: Invalid API key",
-                    "response_data": None,
-                    "rate_limited": False
-                }
-            elif response.status_code == 429:
-                return {
-                    "is_valid": True,  # 密钥有效，但达到速率限制
-                    "error_message": "Rate limited",
-                    "response_data": None,
-                    "rate_limited": True
-                }
-            elif response.status_code == 403:
-                return {
-                    "is_valid": False,
-                    "error_message": "Forbidden: Access denied",
-                    "response_data": None,
-                    "rate_limited": False
-                }
-            else:
-                return {
-                    "is_valid": False,
-                    "error_message": f"HTTP {response.status_code}: {response.text}",
-                    "response_data": None,
-                    "rate_limited": False
-                }
-                
-        except requests.exceptions.Timeout:
-            logger.error(f"Timeout validating key: {api_key[:10]}...")
-            return {
-                "is_valid": False,
-                "error_message": "Request timeout",
-                "response_data": None,
-                "rate_limited": False
-            }
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed for key validation: {e}")
-            return {
-                "is_valid": False,
-                "error_message": f"Request failed: {str(e)}",
-                "response_data": None,
-                "rate_limited": False
-            }
-    
-    def check_key_quota(self, api_key: str) -> Dict[str, Any]:
-        """检查API密钥配额信息"""
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        try:
-            # 尝试获取模型列表作为配额检查
-            response = self.session.get(
-                f"{self.base_url}/models",
-                headers=headers,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                models_data = response.json()
-                return {
-                    "has_quota": True,
-                    "quota_info": {
-                        "models_available": len(models_data.get("data", [])),
-                        "models_list": [model.get("id") for model in models_data.get("data", [])[:5]],  # 只显示前5个
-                        "timestamp": datetime.now().isoformat()
-                    },
-                    "error_message": None
-                }
-            else:
-                return {
-                    "has_quota": False,
-                    "quota_info": None,
-                    "error_message": f"HTTP {response.status_code}"
-                }
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Quota check failed: {e}")
-            return {
-                "has_quota": False,
-                "quota_info": None,
-                "error_message": str(e)
+        proxies = None
+        if proxy_config:
+            proxies = {
+                'http': proxy_config.get('http'),
+                'https': proxy_config.get('https', proxy_config.get('http'))
             }
 
-class GitHubScanner:
-    """GitHub仓库扫描器"""
-    
-    def __init__(self):
-        # 从环境变量读取配置
-        self.github_tokens = os.getenv('GITHUB_TOKENS', '').split(',')
-        self.github_tokens = [token.strip() for token in self.github_tokens if token.strip()]
+        # 发送请求到 SiliconFlow API
+        response = requests.post(
+            "https://api.siliconflow.cn/v1/chat/completions",
+            headers=headers,
+            json=data,
+            proxies=proxies,
+            timeout=10
+        )
         
-        if not self.github_tokens:
-            raise ValueError("GITHUB_TOKENS environment variable is required")
-        
-        # 配置参数
-        self.data_path = Path(os.getenv('DATA_PATH', './data'))
-        self.queries_file = os.getenv('QUERIES_FILE', 'queries.txt')
-        self.date_range_days = int(os.getenv('DATE_RANGE_DAYS', '730'))
-        self.proxy_list = [p.strip() for p in os.getenv('PROXY', '').split(',') if p.strip()]
-        
-        # 文件路径配置
-        self.valid_key_prefix = os.getenv('VALID_KEY_PREFIX', 'keys/keys_valid_siliconflow_')
-        self.rate_limited_key_prefix = os.getenv('RATE_LIMITED_KEY_PREFIX', 'keys/key_429_siliconflow_')
-        self.keys_send_prefix = os.getenv('KEYS_SEND_PREFIX', 'keys/keys_send_siliconflow_')
-        self.valid_key_detail_prefix = os.getenv('VALID_KEY_DETAIL_PREFIX', 'logs/keys_valid_detail_siliconflow_')
-        self.rate_limited_key_detail_prefix = os.getenv('RATE_LIMITED_KEY_DETAIL_PREFIX', 'logs/key_429_detail_siliconflow_')
-        self.scanned_shas_file = os.getenv('SCANNED_SHAS_FILE', 'scanned_shas_siliconflow.txt')
-        
-        # 文件路径黑名单
-        blacklist_str = os.getenv('FILE_PATH_BLACKLIST', 
-                                  'readme,docs,doc/,.md,example,sample,tutorial,test,spec,demo,mock')
-        self.file_path_blacklist = [item.strip().lower() for item in blacklist_str.split(',')]
-        
-        # SiliconFlow密钥正则表达式 - 匹配sk-开头的密钥
-        self.api_key_pattern = re.compile(r'sk-[A-Za-z0-9]{20,}')
-        
-        # 创建必要的目录
-        self.ensure_directories()
-        
-        # 初始化验证器
-        model = os.getenv('HAJIMI_CHECK_MODEL', 'Qwen/Qwen2.5-7B-Instruct')
-        proxy = self.proxy_list[0] if self.proxy_list else None
-        self.validator = SiliconFlowValidator(model=model, proxy=proxy)
-        
-        # 初始化数据库
-        self.init_database()
-        
-        # 加载已扫描的SHA
-        self.scanned_shas = self.load_scanned_shas()
-        
-        # GitHub API相关
-        self.current_token_index = 0
-        self.github_session = aiohttp.ClientSession()
-    
-    def ensure_directories(self):
-        """确保必要的目录存在"""
-        directories = [
-            self.data_path,
-            self.data_path / 'keys',
-            self.data_path / 'logs',
-            self.data_path / 'db'
-        ]
-        
-        for directory in directories:
-            directory.mkdir(parents=True, exist_ok=True)
-    
-    def init_database(self):
-        """初始化SQLite数据库"""
-        db_path = self.data_path / 'db' / 'siliconflow_keys.db'
-        self.conn = sqlite3.connect(str(db_path))
-        
-        # 创建表
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS api_keys (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                api_key TEXT UNIQUE NOT NULL,
-                repo_full_name TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                file_sha TEXT NOT NULL,
-                raw_url TEXT NOT NULL,
-                commit_sha TEXT,
-                last_modified TEXT,
-                is_valid BOOLEAN,
-                rate_limited BOOLEAN DEFAULT 0,
-                error_message TEXT,
-                quota_info TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                validated_at TIMESTAMP
-            )
-        ''')
-        
-        self.conn.commit()
-    
-    def load_scanned_shas(self) -> Set[str]:
-        """加载已扫描的文件SHA列表"""
-        sha_file = self.data_path / self.scanned_shas_file
-        if sha_file.exists():
-            try:
-                with open(sha_file, 'r') as f:
-                    return set(line.strip() for line in f if line.strip())
-            except Exception as e:
-                logger.warning(f"Failed to load scanned SHAs: {e}")
-        return set()
-    
-    def save_scanned_sha(self, sha: str):
-        """保存已扫描的文件SHA"""
-        self.scanned_shas.add(sha)
-        sha_file = self.data_path / self.scanned_shas_file
-        try:
-            with open(sha_file, 'a') as f:
-                f.write(f"{sha}\n")
-        except Exception as e:
-            logger.error(f"Failed to save scanned SHA: {e}")
-    
-    def load_queries(self) -> List[str]:
-        """加载搜索查询配置"""
-        queries = []
-        
-        # 默认SiliconFlow搜索查询
-        default_queries = [
-            'sk- in:file',
-            '"sk-" in:file filename:.env',
-            '"sk-" in:file filename:config',
-            '"sk-" in:file filename:.json',
-            '"sk-" in:file filename:.yaml',
-            'api.siliconflow.cn in:file',
-            '"api.siliconflow.cn" in:file',
-            'siliconflow in:file extension:env',
-            '"sk-" "siliconflow" in:file',
-            '"sk-" "api.siliconflow.cn" in:file',
-            'SILICONFLOW_API_KEY in:file',
-            'SILICON_FLOW_KEY in:file'
-        ]
-        
-        # 尝试从文件加载
-        try:
-            if os.path.exists(self.queries_file):
-                with open(self.queries_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            queries.append(line)
+        if response.status_code == 200:
+            return "ok"
+        elif response.status_code == 401:
+            return "unauthorized"
+        elif response.status_code == 429:
+            return "rate_limited"
+        elif response.status_code == 403:
+            return "forbidden"
+        else:
+            return f"error_code:{response.status_code}"
             
-            if not queries:
-                logger.info("No queries found in file, using default SiliconFlow queries")
-                queries = default_queries
-                
-        except Exception as e:
-            logger.error(f"Failed to load queries from {self.queries_file}: {e}")
-            logger.info("Using default SiliconFlow queries")
-            queries = default_queries
-        
-        logger.info(f"Loaded {len(queries)} search queries")
-        return queries
-    
-    def get_current_token(self) -> str:
-        """获取当前的GitHub令牌"""
-        token = self.github_tokens[self.current_token_index]
-        self.current_token_index = (self.current_token_index + 1) % len(self.github_tokens)
-        return token
-    
-    def should_skip_file(self, file_path: str) -> bool:
-        """判断是否应该跳过某个文件"""
-        file_path_lower = file_path.lower()
-        
-        for blacklist_item in self.file_path_blacklist:
-            if blacklist_item in file_path_lower:
-                return True
-        
-        return False
-    
-    async def search_github_code(self, query: str, per_page: int = 100) -> List[Dict]:
-        """搜索GitHub代码"""
-        results = []
-        page = 1
-        max_pages = 10  # 限制最大页数
-        
-        # 添加日期范围过滤
-        date_filter = (datetime.now() - timedelta(days=self.date_range_days)).strftime('%Y-%m-%d')
-        enhanced_query = f"{query} pushed:>{date_filter}"
-        
-        while page <= max_pages:
-            try:
-                token = self.get_current_token()
-                headers = {
-                    'Authorization': f'token {token}',
-                    'Accept': 'application/vnd.github.v3+json',
-                    'User-Agent': 'SiliconFlow-Key-Scanner/1.0'
-                }
-                
-                params = {
-                    'q': enhanced_query,
-                    'per_page': per_page,
-                    'page': page
-                }
-                
-                url = f"https://api.github.com/search/code?{urlencode(params)}"
-                
-                async with self.github_session.get(url, headers=headers) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        items = data.get('items', [])
-                        
-                        if not items:
-                            break
-                        
-                        results.extend(items)
-                        
-                        # 检查是否还有更多结果
-                        if len(items) < per_page:
-                            break
-                        
-                        page += 1
-                        
-                        # API速率限制处理
-                        await asyncio.sleep(1)
-                        
-                    elif response.status == 403:
-                        logger.warning("GitHub API rate limit exceeded, waiting...")
-                        await asyncio.sleep(60)
-                        continue
-                    elif response.status == 422:
-                        logger.warning(f"Invalid query: {enhanced_query}")
-                        break
-                    else:
-                        logger.error(f"GitHub API error: {response.status}")
-                        break
-                        
-            except Exception as e:
-                logger.error(f"Error searching GitHub: {e}")
-                await asyncio.sleep(5)
-                break
-        
-        logger.info(f"Found {len(results)} results for query: {query}")
-        return results
-    
-    async def get_file_content(self, raw_url: str) -> Optional[str]:
-        """获取文件内容"""
-        try:
-            proxy = random.choice(self.proxy_list) if self.proxy_list else None
-            connector = aiohttp.TCPConnector()
-            
-            async with aiohttp.ClientSession(connector=connector) as session:
-                proxy_url = proxy if proxy else None
-                async with session.get(raw_url, proxy=proxy_url, timeout=30) as response:
-                    if response.status == 200:
-                        content = await response.text()
-                        return content
-                    else:
-                        logger.warning(f"Failed to fetch file content: {response.status}")
-                        return None
-                        
-        except Exception as e:
-            logger.error(f"Error fetching file content from {raw_url}: {e}")
-            return None
-    
-    def extract_api_keys(self, content: str) -> List[str]:
-        """从文件内容中提取SiliconFlow API密钥"""
-        if not content:
-            return []
-        
-        # 查找所有匹配的密钥
-        matches = self.api_key_pattern.findall(content)
-        
-        # 去重并过滤
-        unique_keys = []
-        seen = set()
-        
-        for key in matches:
-            if key not in seen and len(key) >= 25:  # 确保密钥长度合理
-                seen.add(key)
-                unique_keys.append(key)
-        
-        return unique_keys
-    
-    def validate_and_save_key(self, result: ScanResult) -> bool:
-        """验证并保存API密钥"""
-        try:
-            # 验证密钥
-            validation_result = self.validator.validate_key(result.api_key)
-            
-            result.is_valid = validation_result['is_valid']
-            result.error_message = validation_result.get('error_message')
-            
-            # 如果密钥有效，检查配额
-            if result.is_valid:
-                quota_result = self.validator.check_key_quota(result.api_key)
-                result.quota_info = quota_result.get('quota_info')
-            
-            # 保存到数据库
-            self.save_to_database(result, validation_result.get('rate_limited', False))
-            
-            # 保存到文件
-            self.save_to_files(result, validation_result.get('rate_limited', False))
-            
-            return result.is_valid
-            
-        except Exception as e:
-            logger.error(f"Error validating key {result.api_key[:10]}...: {e}")
-            result.error_message = str(e)
-            return False
-    
-    def save_to_database(self, result: ScanResult, rate_limited: bool):
-        """保存结果到数据库"""
-        try:
-            quota_info_json = json.dumps(result.quota_info) if result.quota_info else None
-            
-            self.conn.execute('''
-                INSERT OR REPLACE INTO api_keys 
-                (api_key, repo_full_name, file_path, file_sha, raw_url, commit_sha, 
-                 last_modified, is_valid, rate_limited, error_message, quota_info, validated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                result.api_key, result.repo_full_name, result.file_path, result.file_sha,
-                result.raw_url, result.commit_sha, result.last_modified, result.is_valid,
-                rate_limited, result.error_message, quota_info_json, datetime.now().isoformat()
-            ))
-            
-            self.conn.commit()
-            
-        except Exception as e:
-            logger.error(f"Error saving to database: {e}")
-    
-    def save_to_files(self, result: ScanResult, rate_limited: bool):
-        """保存结果到文件"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        try:
-            # 确定文件前缀
-            if result.is_valid and not rate_limited:
-                key_prefix = self.valid_key_prefix
-                detail_prefix = self.valid_key_detail_prefix
-            elif rate_limited:
-                key_prefix = self.rate_limited_key_prefix
-                detail_prefix = self.rate_limited_key_detail_prefix
-            else:
-                return  # 无效密钥不保存到文件
-            
-            # 保存密钥到简单文件
-            key_file = self.data_path / f"{key_prefix}{timestamp}.txt"
-            with open(key_file, 'a', encoding='utf-8') as f:
-                f.write(f"{result.api_key}\n")
-            
-            # 保存详细信息
-            detail_file = self.data_path / f"{detail_prefix}{timestamp}.log"
-            detail_info = {
-                "timestamp": datetime.now().isoformat(),
-                "api_key": result.api_key,
-                "repo_full_name": result.repo_full_name,
-                "file_path": result.file_path,
-                "raw_url": result.raw_url,
-                "is_valid": result.is_valid,
-                "rate_limited": rate_limited,
-                "error_message": result.error_message,
-                "quota_info": result.quota_info
-            }
-            
-            with open(detail_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(detail_info, ensure_ascii=False) + "\n")
-            
-        except Exception as e:
-            logger.error(f"Error saving to files: {e}")
-    
-    async def process_search_result(self, item: Dict) -> int:
-        """处理搜索结果项"""
-        try:
-            file_sha = item.get('sha')
-            if file_sha in self.scanned_shas:
-                return 0
-            
-            file_path = item.get('path', '')
-            if self.should_skip_file(file_path):
-                logger.debug(f"Skipping blacklisted file: {file_path}")
-                return 0
-            
-            # 获取文件内容
-            raw_url = item.get('html_url', '').replace('/blob/', '/raw/')
-            content = await self.get_file_content(raw_url)
-            
-            if not content:
-                return 0
-            
-            # 提取API密钥
-            api_keys = self.extract_api_keys(content)
-            if not api_keys:
-                self.save_scanned_sha(file_sha)
-                return 0
-            
-            valid_count = 0
-            
-            # 处理每个找到的密钥
-            for api_key in api_keys:
-                result = ScanResult(
-                    repo_full_name=item.get('repository', {}).get('full_name', ''),
-                    file_path=file_path,
-                    file_sha=file_sha,
-                    api_key=api_key,
-                    raw_url=raw_url,
-                    commit_sha=item.get('sha', ''),
-                    last_modified=item.get('repository', {}).get('updated_at', '')
-                )
-                
-                # 验证并保存密钥
-                if self.validate_and_save_key(result):
-                    valid_count += 1
-                    logger.info(f"✅ Valid SiliconFlow key found: {api_key[:15]}... from {result.repo_full_name}/{file_path}")
-                else:
-                    logger.warning(f"❌ Invalid key: {api_key[:15]}... from {result.repo_full_name}/{file_path}")
-                
-                # 添加延迟避免过快验证
-                await asyncio.sleep(2)
-            
-            self.save_scanned_sha(file_sha)
-            return valid_count
-            
-        except Exception as e:
-            logger.error(f"Error processing search result: {e}")
-            return 0
-    
-    async def run_scan(self):
-        """运行扫描"""
-        logger.info("�� Starting SiliconFlow API key scan...")
-        
-        queries = self.load_queries()
-        total_valid_keys = 0
-        total_processed = 0
-        
-        try:
-            for i, query in enumerate(queries, 1):
-                logger.info(f"�� Processing query {i}/{len(queries)}: {query}")
-                
-                # 搜索GitHub
-                search_results = await self.search_github_code(query)
-                
-                if not search_results:
-                    logger.info(f"No results found for query: {query}")
-                    continue
-                
-                # 处理搜索结果
-                for item in search_results:
-                    valid_keys = await self.process_search_result(item)
-                    total_valid_keys += valid_keys
-                    total_processed += 1
-                    
-                    # 每处理一定数量后输出统计
-                    if total_processed % 50 == 0:
-                        logger.info(f"�� Progress: {total_processed} files processed, {total_valid_keys} valid keys found")
-                
-                # 查询间隔
-                await asyncio.sleep(5)
-            
-            logger.info(f"�� Scan completed! Processed: {total_processed}, Valid keys found: {total_valid_keys}")
-            
-        except KeyboardInterrupt:
-            logger.info("⛔ Scan interrupted by user")
-        except Exception as e:
-            logger.error(f"❌ Scan failed: {e}")
-        finally:
-            await self.cleanup()
-    
-    async def cleanup(self):
-        """清理资源"""
-        try:
-            await self.github_session.close()
-            self.conn.close()
-            if hasattr(self.validator, 'session'):
-                self.validator.session.close()
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+    except requests.exceptions.Timeout:
+        return "timeout"
+    except requests.exceptions.ConnectionError:
+        return "connection_error"
+    except requests.exceptions.RequestException as e:
+        if "429" in str(e) or "rate limit" in str(e).lower():
+            return "rate_limited"
+        return f"request_error:{e.__class__.__name__}"
+    except Exception as e:
+        return f"error:{e.__class__.__name__}"
+
+
+def print_skip_stats():
+    """打印跳过统计信息"""
+    total_skipped = sum(skip_stats.values())
+    if total_skipped > 0:
+        logger.info(f"�� Skipped {total_skipped} items - Time: {skip_stats['time_filter']}, Duplicate: {skip_stats['sha_duplicate']}, Age: {skip_stats['age_filter']}, Docs: {skip_stats['doc_filter']}")
+
+
+def reset_skip_stats():
+    """重置跳过统计"""
+    global skip_stats
+    skip_stats = {"time_filter": 0, "sha_duplicate": 0, "age_filter": 0, "doc_filter": 0}
+
 
 def main():
-    """主函数"""
-    try:
-        scanner = GitHubScanner()
-        asyncio.run(scanner.run_scan())
-    except KeyboardInterrupt:
-        logger.info("Program interrupted by user")
-    except Exception as e:
-        logger.error(f"Program failed: {e}")
+    start_time = datetime.now()
+
+    # 打印系统启动信息
+    logger.info("=" * 60)
+    logger.info("�� SILICONFLOW KEY SCANNER STARTING")
+    logger.info("=" * 60)
+    logger.info(f"⏰ Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # 1. 检查配置
+    if not Config.check():
+        logger.info("❌ Config check failed. Exiting...")
         sys.exit(1)
+    # 2. 检查文件管理器
+    if not file_manager.check():
+        logger.error("❌ FileManager check failed. Exiting...")
+        sys.exit(1)
+
+    # 2.5. 显示SyncUtils状态和队列信息
+    if sync_utils.balancer_enabled:
+        logger.info("�� SyncUtils ready for async key syncing")
+        
+    # 显示队列状态
+    balancer_queue_count = len(checkpoint.wait_send_balancer)
+    gpt_load_queue_count = len(checkpoint.wait_send_gpt_load)
+    logger.info(f"�� Queue status - Balancer: {balancer_queue_count}, GPT Load: {gpt_load_queue_count}")
+
+    # 3. 显示系统信息
+    search_queries = file_manager.get_search_queries()
+    logger.info("�� SYSTEM INFORMATION:")
+    logger.info(f"�� GitHub tokens: {len(Config.GITHUB_TOKENS)} configured")
+    logger.info(f"�� Search queries: {len(search_queries)} loaded")
+    logger.info(f"�� Date filter: {Config.DATE_RANGE_DAYS} days")
+    logger.info(f"�� Target: SiliconFlow API keys (sk-*)")
+    logger.info(f"�� API endpoint: api.siliconflow.cn")
+    if Config.PROXY_LIST:
+        logger.info(f"�� Proxy: {len(Config.PROXY_LIST)} proxies configured")
+
+    if checkpoint.last_scan_time:
+        logger.info(f"�� Checkpoint found - Incremental scan mode")
+        logger.info(f"   Last scan: {checkpoint.last_scan_time}")
+        logger.info(f"   Scanned files: {len(checkpoint.scanned_shas)}")
+        logger.info(f"   Processed queries: {len(checkpoint.processed_queries)}")
+    else:
+        logger.info(f"�� No checkpoint - Full scan mode")
+
+
+    logger.info("✅ System ready - Starting SiliconFlow key scanner")
+    logger.info("=" * 60)
+
+    total_keys_found = 0
+    total_rate_limited_keys = 0
+    loop_count = 0
+
+    while True:
+        try:
+            loop_count += 1
+            logger.info(f"�� Loop #{loop_count} - {datetime.now().strftime('%H:%M:%S')}")
+
+            query_count = 0
+            loop_processed_files = 0
+            reset_skip_stats()
+
+            for i, q in enumerate(search_queries, 1):
+                normalized_q = normalize_query(q)
+                if normalized_q in checkpoint.processed_queries:
+                    logger.info(f"�� Skipping already processed query: [{q}],index:#{i}")
+                    continue
+
+                res = github_utils.search_for_keys(q)
+
+                if res and "items" in res:
+                    items = res["items"]
+                    if items:
+                        query_valid_keys = 0
+                        query_rate_limited_keys = 0
+                        query_processed = 0
+
+                        for item_index, item in enumerate(items, 1):
+
+                            # 每20个item保存checkpoint并显示进度
+                            if item_index % 20 == 0:
+                                logger.info(
+                                    f"�� Progress: {item_index}/{len(items)} | query: {q} | current valid: {query_valid_keys} | current rate limited: {query_rate_limited_keys} | total valid: {total_keys_found} | total rate limited: {total_rate_limited_keys}")
+                                file_manager.save_checkpoint(checkpoint)
+                                file_manager.update_dynamic_filenames()
+
+                            # 检查是否应该跳过此item
+                            should_skip, skip_reason = should_skip_item(item, checkpoint)
+                            if should_skip:
+                                logger.info(f"�� Skipping item,name: {item.get('path','').lower()},index:{item_index} - reason: {skip_reason}")
+                                continue
+
+                            # 处理单个item
+                            valid_count, rate_limited_count = process_item(item)
+
+                            query_valid_keys += valid_count
+                            query_rate_limited_keys += rate_limited_count
+                            query_processed += 1
+
+                            # 记录已扫描的SHA
+                            checkpoint.add_scanned_sha(item.get("sha"))
+
+                            loop_processed_files += 1
+
+
+
+                        total_keys_found += query_valid_keys
+                        total_rate_limited_keys += query_rate_limited_keys
+
+                        if query_processed > 0:
+                            logger.info(f"✅ Query {i}/{len(search_queries)} complete - Processed: {query_processed}, Valid: +{query_valid_keys}, Rate limited: +{query_rate_limited_keys}")
+                        else:
+                            logger.info(f"⏭️ Query {i}/{len(search_queries)} complete - All items skipped")
+
+                        print_skip_stats()
+                    else:
+                        logger.info(f"�� Query {i}/{len(search_queries)} - No items found")
+                else:
+                    logger.warning(f"❌ Query {i}/{len(search_queries)} failed")
+
+                checkpoint.add_processed_query(normalized_q)
+                query_count += 1
+
+                checkpoint.update_scan_time()
+                file_manager.save_checkpoint(checkpoint)
+                file_manager.update_dynamic_filenames()
+
+                if query_count % 5 == 0:
+                    logger.info(f"⏸️ Processed {query_count} queries, taking a break...")
+                    time.sleep(1)
+
+            logger.info(f"�� Loop #{loop_count} complete - Processed {loop_processed_files} files | Total valid: {total_keys_found} | Total rate limited: {total_rate_limited_keys}")
+
+            logger.info(f"�� Sleeping for 10 seconds...")
+            time.sleep(10)
+
+        except KeyboardInterrupt:
+            logger.info("⛔ Interrupted by user")
+            checkpoint.update_scan_time()
+            file_manager.save_checkpoint(checkpoint)
+            logger.info(f"�� Final stats - Valid keys: {total_keys_found}, Rate limited: {total_rate_limited_keys}")
+            logger.info("�� Shutting down sync utils...")
+            sync_utils.shutdown()
+            break
+        except Exception as e:
+            logger.error(f"�� Unexpected error: {e}")
+            traceback.print_exc()
+            logger.info("�� Continuing...")
+            continue
+
 
 if __name__ == "__main__":
     main()
