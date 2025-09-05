@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  siliconflow-key-scanner:
+    image: siliconflow-key-scanner:0.0.1
+    container_name: siliconflow-key-scanner
+    restart: unless-stopped
+    network_mode: host
+    # 环境变量
+    env_file:
+      - .env
+    
+    # 数据卷挂载
+    volumes:
+      - ./data:/app/data
